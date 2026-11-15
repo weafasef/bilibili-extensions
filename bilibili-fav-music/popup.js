@@ -127,7 +127,7 @@
       statusTitle.textContent = "另一个标签页正在听歌";
       statusDesc.textContent = onVideoPage
         ? "当前标签页是普通B站视频页（不受影响）。可以跳去听歌页，或改用当前页听歌。"
-        : "当前页面不受影响。可以跳去听歌页，或新开一个标签页听歌。";
+        : "当前页面不受影响。点「定位过去」可以跳到正在听歌的那个标签页。";
 
       const focusBtn = document.createElement("button");
       focusBtn.className = "btn btn-ghost";
@@ -139,13 +139,8 @@
 
       const otherBtn = document.createElement("button");
       otherBtn.className = "btn btn-primary";
-      if (onVideoPage) {
-        otherBtn.textContent = "改用当前页";
-        otherBtn.onclick = () => runEnableMusic(otherBtn, { tabId: curTabId, adoptCurrent: true, label: "改用当前页" });
-      } else {
-        otherBtn.textContent = "新开标签页听";
-        otherBtn.onclick = () => runEnableMusic(otherBtn, { tabId: curTabId, forceNewTab: true, label: "新开标签页听" });
-      }
+      otherBtn.textContent = "改用当前页";
+      otherBtn.onclick = () => runEnableMusic(otherBtn, { tabId: curTabId, adoptCurrent: true, label: "改用当前页" });
 
       const offBtn = document.createElement("button");
       offBtn.className = "btn btn-outline";
@@ -158,7 +153,11 @@
         }
       };
 
-      tabModeActions.append(focusBtn, otherBtn, offBtn);
+      if (onVideoPage) {
+        tabModeActions.append(focusBtn, otherBtn, offBtn);
+      } else {
+        tabModeActions.append(focusBtn, offBtn);
+      }
     } else {
       // 尚未开启听歌模式
       tabModeCard.classList.remove("is-active");
