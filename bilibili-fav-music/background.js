@@ -354,6 +354,54 @@ async function navigateMusicTabToTrack(state, track) {
   }
 }
 
+// 判断某个 URL 是否是可以“原地接管”的 B 站视频页
+function isBilibiliVideoUrl(url) {
+  try {
+    const u = new URL(url || "");
+    if (!/(^|\.)bilibili\.com$/i.test(u.hostname)) return false;
+    return /\/video\/BV[0-9A-Za-z]+/i.test(u.pathname) || /^\/list\//.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function getTabSafely(tabId) {
+  if (!tabId) return null;
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+}
+
+async function activateTab(tab) {
+  if (!tab) return;
+  try {
+    await chrome.tabs.update(tab.id, { active: true });
+    if (tab.windowId !== undefined) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+// 在新标签页里开始听歌：当前正在看的页面（比如网课、文档）完全不受影响
+async function openMusicTabWithTrack(state, track, { active = true } = {}) {
+  const url = track ? buildTrackUrl(track) : "https://www.bilibili.com/";
+  let created = null;
+  try {
+    created = await chrome.tabs.create({ url, active });
+  } catch {
+    return null;
+  }
+  if (!created) return null;
+  state.musicTabId = created.id;
+  if (track) state.currentTrack = track;
+  await saveState(state);
+  return created;
+}
+
 async function notifyTabMusicMode(tabId, isMusicTab, state) {
   if (!tabId) return;
   try {
@@ -374,6 +422,16 @@ chrome.tabs.onRemoved.addListener(async (closedTabId) => {
   if (state.musicTabId === closedTabId) {
     state.musicTabId = null;
     await saveState(state);
+  }
+});
+
+// 新开的听歌标签页加载完成后再补发一次激活指令，避免“插件状态还没写入存储、页面已经加载完”的竞态
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  if (!tab?.url || !isBilibiliVideoUrl(tab.url)) return;
+  const state = await getState();
+  if (state.musicTabId === tabId) {
+    await notifyTabMusicMode(tabId, true, state);
   }
 });
 
@@ -426,15 +484,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       case "ENABLE_MUSIC_TAB": {
-        const targetTabId = Number(msg.tabId);
-        if (!targetTabId) {
-          sendResponse({ ok: false, error: "无效的标签页 ID" });
-          break;
-        }
-        const prevMusicTabId = state.musicTabId;
-        if (prevMusicTabId && prevMusicTabId !== targetTabId) {
-          await notifyTabMusicMode(prevMusicTabId, false, state);
-        }
+        const targetTabId = Number(msg.tabId) || null;
+        const forceNewTab = Boolean(msg.forceNewTab);
+        const adoptCurrent = Boolean(msg.adoptCurrent);
 
         // 确保当前收藏夹已加载歌单（未登录 / 无收藏夹时不做任何跳转）
         if (!state.itemsByFolder[state.currentFolderId] || state.itemsByFolder[state.currentFolderId].length === 0) {
@@ -448,49 +500,104 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             ok: false,
             error: state.userMid
               ? "没有读取到收藏夹，请先在B站点开一个收藏夹页面并登录后再试"
-              : "请先在浏览器中登录B站，再点击开启听歌模式",
+              : "请先在浏览器中登录B站，再点击开始听歌",
             state
           });
           break;
         }
 
-        state.musicTabId = targetTabId;
         // 默认开启时确保是有效的播放模式（初始为随机播放 shuffle）
         if (!state.playMode) {
           state.playMode = "shuffle";
         }
 
-        let tabInfo = null;
-        try {
-          tabInfo = await chrome.tabs.get(targetTabId);
-        } catch {
-          // ignore
+        const playable = buildPlayableTracks(state);
+        const targetTab = await getTabSafely(targetTabId);
+        const existingMusicTab = await getTabSafely(state.musicTabId);
+        const canAdoptCurrent = !forceNewTab && Boolean(targetTab) && isBilibiliVideoUrl(targetTab?.url);
+
+        // 情况 1：原地接管用户当前这个 B 站视频页（只会发生在用户明确点「设为听歌专属页 / 改用当前页」时）
+        if (canAdoptCurrent && (adoptCurrent || !existingMusicTab)) {
+          if (existingMusicTab && existingMusicTab.id !== targetTab.id) {
+            await notifyTabMusicMode(existingMusicTab.id, false, state);
+          }
+          state.musicTabId = targetTab.id;
+
+          const parsed = parseBvidAndPFromUrl(targetTab.url || "");
+          const matchedInFolder = parsed
+            ? (playable.find(t => t.bvid === parsed.bvid && t.p === parsed.p) || playable.find(t => t.bvid === parsed.bvid))
+            : null;
+
+          if (matchedInFolder && parsed && parsed.isCleanVideoPage) {
+            // 当前标签页已经在播放歌单里的某首纯视频页，直接接管并自动开播
+            state.currentTrack = matchedInFolder;
+            await saveState(state);
+            await notifyTabMusicMode(targetTab.id, true, state);
+          } else {
+            // /list/ml... 连播页或其他 B 站视频页：跳到纯粹的单视频页接管播放
+            const trackToPlay = matchedInFolder || chooseNextTrack(state) || playable[0];
+            state.currentTrack = trackToPlay;
+            await saveState(state);
+            if (trackToPlay) {
+              await navigateMusicTabToTrack(state, trackToPlay);
+            }
+          }
+
+          sendResponse({
+            ok: true,
+            state,
+            adoptedCurrentTab: true,
+            playableCount: playable.length
+          });
+          break;
         }
 
-        const playable = buildPlayableTracks(state);
-        const parsed = parseBvidAndPFromUrl(tabInfo?.url || "");
-        const matchedInFolder = parsed
-          ? (playable.find(t => t.bvid === parsed.bvid && t.p === parsed.p) || playable.find(t => t.bvid === parsed.bvid))
-          : null;
+        // 情况 2：已经有听歌标签页在运行 —— 直接复用它，不新开也不碰当前页
+        if (existingMusicTab) {
+          const parsedExisting = parseBvidAndPFromUrl(existingMusicTab.url || "");
+          const matchedExisting = parsedExisting
+            ? (playable.find(t => t.bvid === parsedExisting.bvid && t.p === parsedExisting.p)
+              || playable.find(t => t.bvid === parsedExisting.bvid))
+            : null;
 
-        if (matchedInFolder && parsed.isCleanVideoPage) {
-          // 当前标签页已经在播放歌单里的某首纯视频页，直接原地接管并自动开播
-          state.currentTrack = matchedInFolder;
-          await saveState(state);
-          await notifyTabMusicMode(targetTabId, true, state);
-        } else {
-          // 如果当前在 /list/ml... 连播页、其他B站页或空白页，直接跳到纯粹的单视频页接管播放
-          const trackToPlay = matchedInFolder || chooseNextTrack(state) || playable[0];
-          state.currentTrack = trackToPlay;
-          await saveState(state);
-          if (trackToPlay) {
-            await navigateMusicTabToTrack(state, trackToPlay);
+          if (matchedExisting) {
+            state.currentTrack = matchedExisting;
+            await saveState(state);
+          } else {
+            const trackToPlay = chooseNextTrack(state) || playable[0];
+            state.currentTrack = trackToPlay;
+            await saveState(state);
+            if (trackToPlay) {
+              await navigateMusicTabToTrack(state, trackToPlay);
+            }
           }
+          await activateTab(existingMusicTab);
+          sendResponse({
+            ok: true,
+            state,
+            reusedExistingTab: true,
+            playableCount: playable.length
+          });
+          break;
+        }
+
+        // 情况 3：当前页不是 B 站视频页（网课、文档、搜索结果……）—— 新开一个标签页听歌，绝不覆盖当前页
+        const trackToPlay = chooseNextTrack(state) || playable[0];
+        if (!trackToPlay) {
+          sendResponse({ ok: false, error: "歌单里没有可播放的歌曲", state });
+          break;
+        }
+        const createdTab = await openMusicTabWithTrack(state, trackToPlay, { active: true });
+        if (!createdTab) {
+          sendResponse({ ok: false, error: "新标签页打开失败，请检查浏览器是否拦截了新建标签页", state });
+          break;
         }
 
         sendResponse({
           ok: true,
           state,
+          openedNewTab: true,
+          newTabId: createdTab.id,
           playableCount: playable.length
         });
         break;
@@ -541,10 +648,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       case "PLAY_SPECIFIC_TRACK": {
-        const { bvid, p = 1, tabId } = msg;
-        if (tabId && !state.musicTabId) {
-          state.musicTabId = Number(tabId);
-        }
+        const { bvid, p = 1 } = msg;
         const playable = buildPlayableTracks(state);
         let track = playable.find(t => t.bvid === bvid && Number(t.p) === Number(p))
           || playable.find(t => t.bvid === bvid);
@@ -570,11 +674,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           state.currentTrack = track;
           await saveState(state);
-          if (state.musicTabId) {
+
+          // 已有听歌标签页就地切歌；没有的话新开一个标签页，绝不覆盖当前正在看的页面
+          const existingMusicTab = await getTabSafely(state.musicTabId);
+          if (existingMusicTab) {
             await navigateMusicTabToTrack(state, track);
+            await activateTab(existingMusicTab);
+            sendResponse({ ok: true, state, reusedExistingTab: true });
+            break;
           }
+
+          const createdTab = await openMusicTabWithTrack(state, track, { active: true });
+          if (!createdTab) {
+            sendResponse({ ok: false, error: "新标签页打开失败，请检查浏览器是否拦截了新建标签页", state });
+            break;
+          }
+          sendResponse({ ok: true, state, openedNewTab: true, newTabId: createdTab.id });
+          break;
         }
-        sendResponse({ ok: true, state });
+        sendResponse({ ok: false, error: "歌单里找不到这首歌，请先同步收藏夹", state });
         break;
       }
 

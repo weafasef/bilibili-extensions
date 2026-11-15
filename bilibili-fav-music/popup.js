@@ -65,10 +65,40 @@
     });
   }
 
+  function isBilibiliVideoTab(tab) {
+    try {
+      const u = new URL(tab?.url || "");
+      return /(^|\.)bilibili\.com$/i.test(u.hostname) && (/\/video\/BV[0-9A-Za-z]+/i.test(u.pathname) || /^\/list\//.test(u.pathname));
+    } catch {
+      return false;
+    }
+  }
+
+  async function runEnableMusic(actionBtn, payload) {
+    actionBtn.disabled = true;
+    actionBtn.textContent = "正在开启...";
+    const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", ...payload });
+    if (res.ok) {
+      currentState = res.state;
+      playableCount = res.playableCount ?? playableCount;
+      renderAll();
+      return true;
+    }
+    actionBtn.disabled = false;
+    actionBtn.textContent = payload.label || "🎵 开始听歌";
+    statusDesc.textContent = res.error || "开启失败，请先在浏览器登录B站后重试。";
+    statusDesc.style.color = "#d33";
+    setTimeout(() => {
+      statusDesc.style.color = "";
+    }, 5000);
+    return false;
+  }
+
   function renderHeaderCard() {
     if (!currentState) return;
     const musicTabId = currentState.musicTabId;
     const curTabId = activeBrowserTab?.id || null;
+    const onVideoPage = isBilibiliVideoTab(activeBrowserTab);
 
     tabModeActions.innerHTML = "";
 
@@ -95,7 +125,9 @@
       tabModeCard.classList.add("is-active");
       statusDot.className = "brand-dot other";
       statusTitle.textContent = "另一个标签页正在听歌";
-      statusDesc.textContent = "当前标签页是普通标签页（不受影响）。你可以跳去听歌页，或改用当前页听歌。";
+      statusDesc.textContent = onVideoPage
+        ? "当前标签页是普通B站视频页（不受影响）。可以跳去听歌页，或改用当前页听歌。"
+        : "当前页面不受影响。可以跳去听歌页，或新开一个标签页听歌。";
 
       const focusBtn = document.createElement("button");
       focusBtn.className = "btn btn-ghost";
@@ -105,18 +137,15 @@
         window.close();
       };
 
-      const switchHereBtn = document.createElement("button");
-      switchHereBtn.className = "btn btn-primary";
-      switchHereBtn.textContent = "改用当前页";
-      switchHereBtn.onclick = async () => {
-        if (!curTabId) return;
-        const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: curTabId });
-        if (res.ok) {
-          currentState = res.state;
-          playableCount = res.playableCount ?? playableCount;
-          renderAll();
-        }
-      };
+      const otherBtn = document.createElement("button");
+      otherBtn.className = "btn btn-primary";
+      if (onVideoPage) {
+        otherBtn.textContent = "改用当前页";
+        otherBtn.onclick = () => runEnableMusic(otherBtn, { tabId: curTabId, adoptCurrent: true, label: "改用当前页" });
+      } else {
+        otherBtn.textContent = "新开标签页听";
+        otherBtn.onclick = () => runEnableMusic(otherBtn, { tabId: curTabId, forceNewTab: true, label: "新开标签页听" });
+      }
 
       const offBtn = document.createElement("button");
       offBtn.className = "btn btn-outline";
@@ -129,37 +158,47 @@
         }
       };
 
-      tabModeActions.append(focusBtn, switchHereBtn, offBtn);
+      tabModeActions.append(focusBtn, otherBtn, offBtn);
     } else {
-      // 尚未开启听歌专属页
+      // 尚未开启听歌模式
       tabModeCard.classList.remove("is-active");
       statusDot.className = "brand-dot";
-      statusTitle.textContent = "当前标签页未开启听歌模式";
-      statusDesc.textContent = "点右侧按钮把当前标签页变成听歌专属页（自动开播 + 默认随机切歌，不改其他页设置）。";
 
-      const enableBtn = document.createElement("button");
-      enableBtn.className = "btn btn-primary";
-      enableBtn.textContent = "🎵 设为听歌专属页";
-      enableBtn.onclick = async () => {
-        if (!curTabId) return;
-        enableBtn.disabled = true;
-        enableBtn.textContent = "正在开启...";
-        const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: curTabId });
-        if (res.ok) {
-          currentState = res.state;
-          playableCount = res.playableCount ?? playableCount;
-          renderAll();
-        } else {
-          enableBtn.disabled = false;
-          enableBtn.textContent = "🎵 设为听歌专属页";
-          statusDesc.textContent = res.error || "开启失败，请先在浏览器登录B站后重试。";
-          statusDesc.style.color = "#d33";
-          setTimeout(() => {
-            statusDesc.style.color = "";
-          }, 4000);
-        }
-      };
-      tabModeActions.appendChild(enableBtn);
+      if (onVideoPage) {
+        statusTitle.textContent = "当前标签页未开启听歌模式";
+        statusDesc.textContent = "开启后本页自动开播、随机切歌。也可以新开一个标签页听，当前页保持原样。";
+
+        const enableBtn = document.createElement("button");
+        enableBtn.className = "btn btn-primary";
+        enableBtn.textContent = "🎵 设为听歌专属页";
+        enableBtn.onclick = () => {
+          if (!curTabId) return;
+          runEnableMusic(enableBtn, { tabId: curTabId, adoptCurrent: true, label: "🎵 设为听歌专属页" });
+        };
+
+        const newTabBtn = document.createElement("button");
+        newTabBtn.className = "btn btn-ghost";
+        newTabBtn.textContent = "新开一页";
+        newTabBtn.title = "不占用当前视频页，另开一个标签页听歌";
+        newTabBtn.onclick = () => {
+          if (!curTabId) return;
+          runEnableMusic(newTabBtn, { tabId: curTabId, forceNewTab: true, label: "新开一页" });
+        };
+
+        tabModeActions.append(enableBtn, newTabBtn);
+      } else {
+        statusTitle.textContent = "当前页面不是B站视频页";
+        statusDesc.textContent = "点右侧按钮会新开一个标签页开始播放歌单，当前页面（网课、文档等）不会被覆盖。";
+
+        const newTabBtn = document.createElement("button");
+        newTabBtn.className = "btn btn-primary";
+        newTabBtn.textContent = "🎵 新开标签页听歌";
+        newTabBtn.onclick = () => {
+          if (!curTabId) return;
+          runEnableMusic(newTabBtn, { tabId: curTabId, forceNewTab: true, label: "🎵 新开标签页听歌" });
+        };
+        tabModeActions.appendChild(newTabBtn);
+      }
     }
   }
 
@@ -249,18 +288,25 @@
 
       const main = document.createElement("div");
       main.className = "song-main";
-      main.title = "点击立即在听歌专属页播放这首";
+      main.title = currentState.musicTabId
+        ? "点击立即在听歌专属页播放这首"
+        : "点击会在新标签页里播放这首，当前页面保持不变";
       main.onclick = async () => {
         const defaultP = pageCount > 1 ? (selectedPages[0] || 1) : 1;
         const res = await sendMsg({
           type: "PLAY_SPECIFIC_TRACK",
           bvid: item.bvid,
-          p: defaultP,
-          tabId: activeBrowserTab?.id
+          p: defaultP
         });
         if (res.ok) {
           currentState = res.state;
           renderAll();
+        } else if (res.error) {
+          statusDesc.textContent = res.error;
+          statusDesc.style.color = "#d33";
+          setTimeout(() => {
+            statusDesc.style.color = "";
+          }, 5000);
         }
       };
 
@@ -424,8 +470,7 @@
             const res = await sendMsg({
               type: "PLAY_SPECIFIC_TRACK",
               bvid: item.bvid,
-              p: pNum,
-              tabId: activeBrowserTab?.id
+              p: pNum
             });
             if (res.ok) {
               currentState = res.state;
@@ -464,6 +509,15 @@
   }
 
   prevBtn.onclick = async () => {
+    if (!currentState?.musicTabId) {
+      const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: activeBrowserTab?.id });
+      if (res.ok) {
+        currentState = res.state;
+        playableCount = res.playableCount ?? playableCount;
+        renderAll();
+      }
+      return;
+    }
     const res = await sendMsg({ type: "PREV_TRACK" });
     if (res.ok) {
       currentState = res.state;
@@ -472,8 +526,8 @@
   };
 
   nextBtn.onclick = async () => {
-    if (!currentState?.musicTabId && activeBrowserTab?.id) {
-      const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: activeBrowserTab.id });
+    if (!currentState?.musicTabId) {
+      const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: activeBrowserTab?.id });
       if (res.ok) {
         currentState = res.state;
         playableCount = res.playableCount ?? playableCount;
@@ -489,8 +543,8 @@
   };
 
   playPauseBtn.onclick = async () => {
-    if (!currentState?.musicTabId && activeBrowserTab?.id) {
-      const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: activeBrowserTab.id });
+    if (!currentState?.musicTabId) {
+      const res = await sendMsg({ type: "ENABLE_MUSIC_TAB", tabId: activeBrowserTab?.id });
       if (res.ok) {
         currentState = res.state;
         playableCount = res.playableCount ?? playableCount;
