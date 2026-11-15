@@ -14,6 +14,14 @@
   let autoPlayDeadline = 0;
   let badgeEl = null;
 
+  // —— 以下三个状态专门用来防止“切走再切回来，正在听的歌被拉回 0 点” ——
+  // 当前曲目标识（BV 号 + 分P）；只有真的换歌才算“重新加载”
+  let currentTrackKey = null;
+  // 这一首是否已经真正播起来过；播起来之后无论播放器重建还是切回标签页，都绝不再回拉
+  let playbackStarted = false;
+  // 这一首的“B站历史进度”判定是否已结束（每首歌只判定一次）
+  let historySeekChecked = false;
+
   const MODE_LABELS = {
     shuffle: "🔀 随机播放",
     order: "🔁 列表循环",
@@ -44,12 +52,49 @@
   window.addEventListener("keydown", markManualInteraction, true);
   window.addEventListener("pointerdown", markManualInteraction, true);
 
+  // 从当前 URL 里取出“这首歌是谁”的标识：BV 号 + 分P
+  function trackKeyFromUrl(urlStr) {
+    try {
+      const u = new URL(urlStr || location.href);
+      const m = u.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i);
+      if (!m) return null;
+      const p = Number(u.searchParams.get("p") || 1) || 1;
+      return `${m[1]}:${p}`;
+    } catch {
+      return null;
+    }
+  }
+
+  // 只有真的换歌时才重置“加载时刻”。
+  // B站播放时经常往 URL 尾巴上加 spm_id_from / vd_source 之类的参数，或者重启播放器，
+  // 这些都不算换歌，不能因此把正在播放的进度当成“刚加载的历史进度”拉回 0 点。
+  function syncTrackAnchor(urlStr) {
+    const key = trackKeyFromUrl(urlStr);
+    if (key === currentTrackKey) return false;
+    currentTrackKey = key;
+    trackLoadWallTime = Date.now();
+    historySeekChecked = false;
+    playbackStarted = false;
+    return true;
+  }
+
   // 如果在刚加载阶段B站自动恢复了上次的历史播放进度，强制拉回 00:00 从头播放
   function enforceStartFromZero(video) {
     if (!isMusicTab || !video || userManuallySeeked) return false;
+    // 已经在正常播放的歌，永远不再回拉（切标签页、恢复播放、播放器重建都走这里）
+    if (playbackStarted || historySeekChecked) return false;
     const elapsedSinceLoadSec = (Date.now() - trackLoadWallTime) / 1000;
-    // 加载后的前 6 秒内，正常从0播放绝不可能超过 elapsed + 2 秒；一旦超出说明是B站恢复了历史观看进度
-    if (elapsedSinceLoadSec < 6 && video.currentTime > Math.max(2.5, elapsedSinceLoadSec + 1.8)) {
+    if (elapsedSinceLoadSec > 12) {
+      // 早就过了“刚加载”的窗口期，以后不再判定
+      historySeekChecked = true;
+      return false;
+    }
+    if (!Number.isFinite(video.currentTime) || video.currentTime <= 0) return false;
+    if (!Number.isFinite(video.duration) || video.duration <= 5) return false;
+    // 从 0 正常播放时，进度最多跑到 流逝时间 × 倍速（再留 2 秒余量）；明显超出说明是B站恢复了历史观看进度
+    const rate = Number.isFinite(video.playbackRate) && video.playbackRate > 1 ? Math.min(video.playbackRate, 8) : 1;
+    const maxLegitSec = elapsedSinceLoadSec * rate + 2;
+    if (video.currentTime > Math.max(3, maxLegitSec)) {
       try {
         video.currentTime = 0;
       } catch {
@@ -126,9 +171,17 @@
   );
 
   function onTimeUpdate(e) {
-    if (!isMusicTab || trackEndTriggered) return;
+    if (!isMusicTab) return;
     const video = e.currentTarget;
     if (!video) return;
+
+    // 进度确实从开头走起来了 —— 这一首进入“已播放”状态，之后任何重新绑定都不再回拉
+    const rate = Number.isFinite(video.playbackRate) && video.playbackRate > 1 ? video.playbackRate : 1;
+    if (!playbackStarted && !video.paused && video.currentTime > 1.5 && video.currentTime < 5 * rate) {
+      playbackStarted = true;
+    }
+
+    if (trackEndTriggered) return;
     if (enforceStartFromZero(video)) return;
     if (!Number.isFinite(video.duration) || video.duration <= 3) return;
     const remaining = video.duration - video.currentTime;
@@ -157,11 +210,12 @@
 
   function attachToVideo(video) {
     if (!video || trackedVideo === video) return;
+    // 注意：这里不重置 trackLoadWallTime，只有真的换歌（BV号/分P 变化）才重置加载时刻
+    syncTrackAnchor(location.href);
     trackedVideo = video;
     trackEndTriggered = false;
     userManuallyPaused = false;
     userManuallySeeked = false;
-    trackLoadWallTime = Date.now();
     autoPlayDeadline = Date.now() + 4500;
 
     video.addEventListener("timeupdate", onTimeUpdate);
@@ -246,13 +300,8 @@
           userManuallyPaused = false;
           userManuallySeeked = false;
           trackEndTriggered = false;
-          trackLoadWallTime = Date.now();
+          // 不在这里把 currentTime 归零：旧版本会因此把“切回标签页 / 播到一半”的歌拉回开头
           autoPlayDeadline = Date.now() + 4500;
-          try {
-            v.currentTime = 0;
-          } catch {
-            // ignore
-          }
         }
         attachToVideo(v);
         tryAutoPlay(v);
@@ -265,11 +314,13 @@
     if (!isMusicTab) return;
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      trackEndTriggered = false;
-      userManuallyPaused = false;
-      userManuallySeeked = false;
-      trackLoadWallTime = Date.now();
-      autoPlayDeadline = Date.now() + 4500;
+      // 只有真的换歌（BV号/分P 变化）才重置状态；只是多了 URL 参数不算换歌
+      if (syncTrackAnchor(location.href)) {
+        trackEndTriggered = false;
+        userManuallyPaused = false;
+        userManuallySeeked = false;
+        autoPlayDeadline = Date.now() + 4500;
+      }
       chrome.runtime.sendMessage({ type: "GET_STATUS" }, (res) => {
         if (!chrome.runtime.lastError && res?.ok) {
           applyMusicModeState(res.isMusicTab, res.state?.playMode, res.state?.currentTrack);
@@ -285,6 +336,61 @@
       }
     }
   }, 500);
+
+  // 切走时记下播放位置；切回来时如果发现同一首歌被（B站或播放器）拉回了开头，就恢复到切走时的位置
+  let hiddenSnapshot = null;
+
+  document.addEventListener("visibilitychange", () => {
+    const v = document.querySelector("video");
+
+    if (document.visibilityState === "hidden") {
+      if (v && !v.paused && Number.isFinite(v.currentTime) && v.currentTime > 0) {
+        hiddenSnapshot = { key: currentTrackKey, time: v.currentTime, at: Date.now() };
+      }
+      return;
+    }
+
+    // —— 切回标签页 ——
+    syncTrackAnchor(location.href);
+
+    const snap = hiddenSnapshot;
+    hiddenSnapshot = null;
+
+    if (!isMusicTab) return;
+
+    if (v) {
+      // 只负责“继续播放”，绝不主动改动播放位置
+      if (v.paused && !userManuallyPaused && !trackEndTriggered) {
+        let retries = 0;
+        const wakeUp = () => {
+          if (!isMusicTab || !v.paused || userManuallyPaused || trackEndTriggered) return;
+          tryAutoPlay(v);
+          if (retries++ < 3) setTimeout(wakeUp, 600);
+        };
+        wakeUp();
+      }
+
+      // 兜底：如果切回来发现还是同一首歌、却被拉回了 0 点，恢复成切走时的进度
+      if (snap && snap.key && snap.key === currentTrackKey && snap.time > 15 && !userManuallySeeked && !trackEndTriggered) {
+        setTimeout(() => {
+          const cur = document.querySelector("video");
+          if (!isMusicTab || !cur || trackEndTriggered || userManuallySeeked) return;
+          if (currentTrackKey !== snap.key) return;
+          if (!Number.isFinite(cur.duration) || cur.duration <= snap.time + 2) return;
+          if (cur.currentTime < 2) {
+            try {
+              cur.currentTime = snap.time;
+            } catch {
+              // ignore
+            }
+          }
+        }, 1200);
+      }
+    }
+  });
+
+  // 页面刚加载时先建立曲目标识（真正换歌时才允许回拉 0 点）
+  syncTrackAnchor(location.href);
 
   // 初始化向 background 查询当前标签页是否为“听歌专属页”
   chrome.runtime.sendMessage({ type: "GET_STATUS" }, (res) => {
