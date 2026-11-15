@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B站首页纯净视频过滤</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="panel">
+    <header class="header">
+      <div class="header-main">
+        <div class="title-wrap">
+          <span class="status-dot" id="statusDot"></span>
+          <span class="title">B站首页纯净视频过滤</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="enabled" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="stat-bar" id="statBar">当前页已过滤 0 个非普通视频卡片</div>
+    </header>
+
+    <section class="rules-card" id="rulesCard">
+      <div class="section-title">勾选要过滤隐藏的内容（实时生效）：</div>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🎥 过滤直播推荐</span>
+          <span class="rule-desc">隐藏左上角带「直播」角标、「直播中」卡片</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-live">0</span>
+          <input type="checkbox" data-key="live" checked />
+        </div>
+      </label>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🐳 过滤纪录片 / 影视 / 综艺</span>
+          <span class="rule-desc">隐藏纪录片、电视剧、电影、综艺等剧集卡</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-docOgv">0</span>
+          <input type="checkbox" data-key="docOgv" checked />
+        </div>
+      </label>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🌸 过滤动漫 / 番剧 / 漫画</span>
+          <span class="rule-desc">隐藏番剧、国创、漫画推荐卡片</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-animeManga">0</span>
+          <input type="checkbox" data-key="animeManga" checked />
+        </div>
+      </label>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🗂️ 过滤叠层频道卡 / 课堂 / 专栏</span>
+          <span class="rule-desc">隐藏底下带多层白底板的特殊推流卡、课堂与活动</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-specialFloor">0</span>
+          <input type="checkbox" data-key="specialFloor" checked />
+        </div>
+      </label>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🛡️ 过滤商业广告与推广</span>
+          <span class="rule-desc">隐藏带有广告、创作推广标识的卡片</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-adPromo">0</span>
+          <input type="checkbox" data-key="adPromo" checked />
+        </div>
+      </label>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">✨ 严格只留普通投稿视频</span>
+          <span class="rule-desc">兜底：非 UP 主正常投稿（/video/BV）一律隐藏</span>
+        </div>
+        <div class="rule-right">
+          <span class="count-pill" id="count-strictBvOnly">0</span>
+          <input type="checkbox" data-key="strictBvOnly" checked />
+        </div>
+      </label>
+
+      <div class="divider"></div>
+
+      <label class="rule-row">
+        <div class="rule-info">
+          <span class="rule-name">🖼️ 隐藏首页左上角大图轮播</span>
+          <span class="rule-desc">可选：隐藏左上角大横幅焦点图</span>
+        </div>
+        <div class="rule-right">
+          <input type="checkbox" data-key="hideSwipe" />
+        </div>
+      </label>
+    </section>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

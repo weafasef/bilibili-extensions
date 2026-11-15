@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "B站首页纯净视频过滤",
+  "version": "1.0.0",
+  "description": "过滤B站首页推荐流中的纪录片、直播、动漫番剧、漫画、影视剧、课堂与广告卡片，只保留普通UP主投稿视频并自动补位。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "B站首页纯净视频过滤",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B站收藏夹纯净听歌</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 顶部：当前标签页听歌专属模式控制 -->
+    <header class="tab-mode-card" id="tabModeCard">
+      <div class="tab-mode-top">
+        <div class="brand">
+          <span class="brand-dot" id="statusDot"></span>
+          <span class="brand-title" id="statusTitle">当前标签页未开启听歌模式</span>
+        </div>
+        <div class="tab-mode-actions" id="tabModeActions">
+          <button class="btn btn-primary" id="enableCurrentTabBtn">🎵 设为听歌专属页</button>
+        </div>
+      </div>
+      <div class="tab-mode-desc" id="statusDesc">
+        开启后仅在该专属标签页内自动开播、随机切歌，绝不改动其他标签页的播放设置。
+      </div>
+    </header>
+
+    <!-- 正在播放与控制栏 -->
+    <section class="player-card">
+      <div class="now-playing">
+        <div class="now-title" id="nowTitle">尚未开始播放</div>
+        <div class="now-meta">
+          <span id="nowUpper">点下方任意歌曲或上方按钮即可开听</span>
+          <span class="now-time" id="nowTime"></span>
+        </div>
+      </div>
+
+      <div class="controls-row">
+        <div class="mode-group" role="group" aria-label="播放模式">
+          <button class="mode-btn active" data-mode="shuffle" title="默认随机播放">🔀 随机</button>
+          <button class="mode-btn" data-mode="order" title="按列表顺序循环">🔁 顺序</button>
+          <button class="mode-btn" data-mode="loop" title="单曲循环">🔂 单曲</button>
+        </div>
+
+        <div class="transport-group">
+          <button class="icon-btn" id="prevBtn" title="上一首">⏮</button>
+          <button class="icon-btn play-btn" id="playPauseBtn" title="播放 / 暂停">⏯</button>
+          <button class="icon-btn" id="nextBtn" title="下一首">⏭</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 收藏夹选择与搜索过滤 -->
+    <section class="toolbar">
+      <div class="folder-row">
+        <label class="folder-label" for="folderSelect">收藏夹</label>
+        <select id="folderSelect" class="folder-select"></select>
+        <button class="btn btn-ghost" id="syncBtn" title="从B站重新同步收藏夹歌曲">🔄 同步</button>
+      </div>
+      <div class="search-row">
+        <input
+          type="search"
+          id="searchInput"
+          class="search-input"
+          placeholder="搜索歌名 / UP主..."
+          autocomplete="off"
+        />
+        <span class="track-counter" id="trackCounter">0 首可播</span>
+      </div>
+    </section>
+
+    <!-- 歌曲列表 -->
+    <main class="playlist-wrap" id="playlistWrap">
+      <div class="empty-state" id="emptyState">正在加载收藏夹歌单...</div>
+      <div class="playlist" id="playlist"></div>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
