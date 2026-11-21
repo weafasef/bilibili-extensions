@@ -3,6 +3,7 @@
 // 不内置任何账号信息：用户 UID 与收藏夹列表都在运行时通过 B 站接口读取当前登录账号
 const DEFAULT_STATE = {
   musicTabId: null,
+  musicModeEnabled: false, // 用户是否开启了听歌模式（用于休眠标签页唤醒/替换 tabId 后自动认领）
   userMid: null,
   userName: "",
   folders: [],
@@ -13,7 +14,9 @@ const DEFAULT_STATE = {
   disabledBvids: {},
   playMode: "shuffle", // 默认随机播放: "shuffle" | "order" | "loop"
   currentTrack: null,
+  currentProgress: null, // { key: "BVxxx:1", time: 123.4, paused: false, updatedAt: 0 }
   shuffleOrder: [],
+  playedKeysInRound: [], // 本轮随机已播放过的曲目 key 列表，确保一轮没听完前绝不重复
   history: [],
   lastSyncAt: 0
 };
@@ -21,10 +24,18 @@ const DEFAULT_STATE = {
 async function getState() {
   const stored = await chrome.storage.local.get("musicState");
   const state = Object.assign({}, DEFAULT_STATE, stored.musicState || {});
+  if (!Array.isArray(state.playedKeysInRound)) {
+    state.playedKeysInRound = [];
+  }
+  if (!Array.isArray(state.shuffleOrder)) {
+    state.shuffleOrder = [];
+  }
   if (state.musicTabId !== null) {
     try {
       await chrome.tabs.get(state.musicTabId);
     } catch {
+      // 注意：这里只清空失效的 tabId，但保留 musicModeEnabled，
+      // 如果是因为浏览器休眠/丢弃标签页导致 tabId 变化，标签页唤醒时可通过 sessionStorage 认领恢复
       state.musicTabId = null;
       await chrome.storage.local.set({ musicState: state });
     }
@@ -168,7 +179,6 @@ async function fetchUserAndFolders(state) {
           title: f.title,
           media_count: Number(f.media_count || 0)
         }));
-        // 如果还没有选定有效收藏夹，默认选中第一个（通常为「默认收藏夹」）
         const hasCurrent = state.folders.some(f => f.id === Number(state.currentFolderId));
         if (!hasCurrent) {
           state.currentFolderId = state.folders[0].id;
@@ -208,7 +218,6 @@ async function fetchVideoPages(bvid, state) {
 // Sync all videos in a favorite folder
 async function syncFolderItems(state, folderId = state.currentFolderId) {
   const targetFolderId = Number(folderId || state.currentFolderId || 0);
-  // 没有可用收藏夹（未登录 / 没有收藏夹）时不发请求
   if (!targetFolderId) return state;
   const allMedias = [];
   let pn = 1;
@@ -236,7 +245,6 @@ async function syncFolderItems(state, folderId = state.currentFolderId) {
     }
     const medias = res.data.medias || [];
     for (const m of medias) {
-      // 过滤已失效视频 (attr !== 0 且标题为已失效视频)
       if (!m || !m.bvid || m.title === "已失效视频") continue;
       const pageCount = Number(m.page || 1);
       allMedias.push({
@@ -259,13 +267,26 @@ async function syncFolderItems(state, folderId = state.currentFolderId) {
     state.itemsByFolder[targetFolderId] = allMedias;
     state.lastSyncAt = Date.now();
 
-    // 预加载多P视频的分P标题（最多前8个未缓存的多P视频，方便用户在面板直接看到每P名字）
     const multiItems = allMedias.filter(m => m.pageCount > 1 && !state.pagesByBvid[m.bvid]).slice(0, 8);
     if (multiItems.length > 0) {
       await Promise.allSettled(multiItems.map(m => fetchVideoPages(m.bvid, state)));
     }
   }
   return state;
+}
+
+// 将某首歌记入“本轮已播放”，并从待播队列里移除，保证第一轮没听完前不会重复抽到
+function markTrackPlayedInRound(state, trackKey) {
+  if (!trackKey) return;
+  if (!Array.isArray(state.playedKeysInRound)) {
+    state.playedKeysInRound = [];
+  }
+  if (!state.playedKeysInRound.includes(trackKey)) {
+    state.playedKeysInRound.push(trackKey);
+  }
+  if (Array.isArray(state.shuffleOrder)) {
+    state.shuffleOrder = state.shuffleOrder.filter(k => k !== trackKey);
+  }
 }
 
 // 选择下一首曲目
@@ -281,6 +302,11 @@ function chooseNextTrack(state, { isAutoEnded = false } = {}) {
     if (found) return found;
   }
 
+  // 把刚刚听完/切走的这首歌记入本轮已播
+  if (currentKey) {
+    markTrackPlayedInRound(state, currentKey);
+  }
+
   // 列表循环模式
   if (state.playMode === "order") {
     const idx = playable.findIndex(t => t.key === currentKey);
@@ -290,18 +316,36 @@ function chooseNextTrack(state, { isAutoEnded = false } = {}) {
     }
     const chosen = playable[nextIdx];
     state.currentTrack = chosen;
+    state.currentProgress = { key: chosen.key, time: 0, paused: false, updatedAt: Date.now() };
+    markTrackPlayedInRound(state, chosen.key);
     return chosen;
   }
 
-  // 随机播放模式（默认）—— 使用不重复洗牌队列，确保听完一轮前不会老是重复同一首
+  // 随机播放模式（默认）—— 使用“不重复洗牌队列 + 本轮已播集合双重保障”
   const validKeys = new Set(playable.map(t => t.key));
-  let queue = (state.shuffleOrder || []).filter(k => validKeys.has(k) && k !== currentKey);
+  const playedSet = new Set((state.playedKeysInRound || []).filter(k => validKeys.has(k)));
+
+  // 清理队列里已经失效、或本轮已经播过的 key
+  let queue = (state.shuffleOrder || []).filter(
+    k => validKeys.has(k) && !playedSet.has(k) && k !== currentKey
+  );
 
   if (queue.length === 0) {
-    queue = shuffleArray(playable.map(t => t.key));
-    if (queue.length > 1 && queue[0] === currentKey) {
-      const swapIdx = 1 + Math.floor(Math.random() * (queue.length - 1));
-      [queue[0], queue[swapIdx]] = [queue[swapIdx], queue[0]];
+    // 优先只从“本轮还没听过的歌”里洗牌
+    const unplayedKeys = playable
+      .map(t => t.key)
+      .filter(k => !playedSet.has(k) && k !== currentKey);
+
+    if (unplayedKeys.length > 0) {
+      queue = shuffleArray(unplayedKeys);
+    } else {
+      // 只有当整张歌单里的每一首歌在本轮全都听过一遍后，才开启新一轮洗牌
+      state.playedKeysInRound = [];
+      queue = shuffleArray(playable.map(t => t.key));
+      if (queue.length > 1 && queue[0] === currentKey) {
+        const swapIdx = 1 + cryptoRandomInt(queue.length - 1);
+        [queue[0], queue[swapIdx]] = [queue[swapIdx], queue[0]];
+      }
     }
   }
 
@@ -312,6 +356,8 @@ function chooseNextTrack(state, { isAutoEnded = false } = {}) {
   }
   const chosen = playable.find(t => t.key === nextKey) || playable[0];
   state.currentTrack = chosen;
+  state.currentProgress = { key: chosen.key, time: 0, paused: false, updatedAt: Date.now() };
+  markTrackPlayedInRound(state, chosen.key);
   return chosen;
 }
 
@@ -328,16 +374,17 @@ function choosePrevTrack(state) {
       state.history = history;
       const chosen = validMap.get(prevKey);
       state.currentTrack = chosen;
+      state.currentProgress = { key: chosen.key, time: 0, paused: false, updatedAt: Date.now() };
       return chosen;
     }
   }
 
-  // 如果没有历史记录，按列表往回退一首或随机选一首
   const currentKey = state.currentTrack?.key;
   const idx = playable.findIndex(t => t.key === currentKey);
   const prevIdx = idx > 0 ? idx - 1 : playable.length - 1;
   const chosen = playable[prevIdx] || playable[0];
   state.currentTrack = chosen;
+  state.currentProgress = { key: chosen.key, time: 0, paused: false, updatedAt: Date.now() };
   return chosen;
 }
 
@@ -397,7 +444,12 @@ async function openMusicTabWithTrack(state, track, { active = true } = {}) {
   }
   if (!created) return null;
   state.musicTabId = created.id;
-  if (track) state.currentTrack = track;
+  state.musicModeEnabled = true;
+  if (track) {
+    state.currentTrack = track;
+    state.currentProgress = { key: track.key, time: 0, paused: false, updatedAt: Date.now() };
+    markTrackPlayedInRound(state, track.key);
+  }
   await saveState(state);
   return created;
 }
@@ -409,23 +461,39 @@ async function notifyTabMusicMode(tabId, isMusicTab, state) {
       type: "MUSIC_MODE_UPDATE",
       isMusicTab,
       playMode: state.playMode,
-      currentTrack: state.currentTrack
+      currentTrack: state.currentTrack,
+      currentProgress: state.currentProgress
     });
   } catch {
     // Tab might not be on bilibili or content script not ready yet
   }
 }
 
-// 当听歌专属标签页被关闭时，自动退出听歌模式，不影响任何其他标签页
+// 当浏览器因为休眠/预渲染替换了标签页 ID 时，无缝继承听歌专属页身份
+if (chrome.tabs.onReplaced) {
+  chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
+    const stored = await chrome.storage.local.get("musicState");
+    const state = Object.assign({}, DEFAULT_STATE, stored.musicState || {});
+    if (state.musicTabId === removedTabId) {
+      state.musicTabId = addedTabId;
+      state.musicModeEnabled = true;
+      await saveState(state);
+    }
+  });
+}
+
+// 当听歌专属标签页被用户真正关闭时，自动退出听歌模式，不影响任何其他标签页
 chrome.tabs.onRemoved.addListener(async (closedTabId) => {
-  const state = await getState();
+  const stored = await chrome.storage.local.get("musicState");
+  const state = Object.assign({}, DEFAULT_STATE, stored.musicState || {});
   if (state.musicTabId === closedTabId) {
     state.musicTabId = null;
+    state.musicModeEnabled = false;
     await saveState(state);
   }
 });
 
-// 新开的听歌标签页加载完成后再补发一次激活指令，避免“插件状态还没写入存储、页面已经加载完”的竞态
+// 新开的或休眠后重新加载的听歌标签页加载完成后，补发一次激活指令
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete") return;
   if (!tab?.url || !isBilibiliVideoUrl(tab.url)) return;
@@ -442,16 +510,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg?.type) {
       case "GET_STATUS": {
         const senderTabId = sender?.tab?.id ?? msg.tabId ?? null;
-        const isMusicTab = Boolean(senderTabId && state.musicTabId === senderTabId);
-        // 如果当前就是听歌专属标签页，根据其 URL 同步当前曲目记录
+        let isMusicTab = Boolean(senderTabId && state.musicTabId === senderTabId);
+
+        // 关键修复：如果听歌标签页因为长时间未点开被浏览器休眠重载（tabId 发生变化或曾短暂失联），
+        // content.js 会携带它在 sessionStorage 里持久化的 claimMusicTab 标记来自动认领回身份
+        if (!isMusicTab && senderTabId && msg.claimMusicTab && state.musicModeEnabled) {
+          const existing = await getTabSafely(state.musicTabId);
+          if (!existing || existing.id === senderTabId) {
+            state.musicTabId = senderTabId;
+            isMusicTab = true;
+            await saveState(state);
+          }
+        }
+
+        // 如果当前就是听歌专属标签页，根据其 URL 同步当前曲目记录（并计入本轮已播）
         if (isMusicTab && sender?.tab?.url) {
           const parsed = parseBvidAndPFromUrl(sender.tab.url);
           if (parsed) {
             const playable = buildPlayableTracks(state);
             const matched = playable.find(t => t.bvid === parsed.bvid && t.p === parsed.p)
               || playable.find(t => t.bvid === parsed.bvid);
-            if (matched && state.currentTrack?.key !== matched.key) {
-              state.currentTrack = matched;
+            if (matched) {
+              markTrackPlayedInRound(state, matched.key);
+              if (state.currentTrack?.key !== matched.key) {
+                state.currentTrack = matched;
+              }
               await saveState(state);
             }
           }
@@ -462,6 +545,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state,
           playableCount: buildPlayableTracks(state).length
         });
+        break;
+      }
+
+      case "REPORT_PROGRESS": {
+        const senderTabId = sender?.tab?.id ?? null;
+        if (senderTabId && state.musicTabId === senderTabId && msg.key) {
+          state.currentProgress = {
+            key: msg.key,
+            time: Number(msg.time || 0),
+            paused: Boolean(msg.paused),
+            updatedAt: Date.now()
+          };
+          markTrackPlayedInRound(state, msg.key);
+          await chrome.storage.local.set({ musicState: state });
+        }
+        sendResponse({ ok: true });
         break;
       }
 
@@ -488,7 +587,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const forceNewTab = Boolean(msg.forceNewTab);
         const adoptCurrent = Boolean(msg.adoptCurrent);
 
-        // 确保当前收藏夹已加载歌单（未登录 / 无收藏夹时不做任何跳转）
         if (!state.itemsByFolder[state.currentFolderId] || state.itemsByFolder[state.currentFolderId].length === 0) {
           await fetchUserAndFolders(state);
           await syncFolderItems(state, state.currentFolderId);
@@ -506,7 +604,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // 默认开启时确保是有效的播放模式（初始为随机播放 shuffle）
         if (!state.playMode) {
           state.playMode = "shuffle";
         }
@@ -516,12 +613,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const existingMusicTab = await getTabSafely(state.musicTabId);
         const canAdoptCurrent = !forceNewTab && Boolean(targetTab) && isBilibiliVideoUrl(targetTab?.url);
 
-        // 情况 1：原地接管用户当前这个 B 站视频页（只会发生在用户明确点「设为听歌专属页 / 改用当前页」时）
+        // 情况 1：原地接管用户当前这个 B 站视频页
         if (canAdoptCurrent && (adoptCurrent || !existingMusicTab)) {
           if (existingMusicTab && existingMusicTab.id !== targetTab.id) {
             await notifyTabMusicMode(existingMusicTab.id, false, state);
           }
           state.musicTabId = targetTab.id;
+          state.musicModeEnabled = true;
 
           const parsed = parseBvidAndPFromUrl(targetTab.url || "");
           const matchedInFolder = parsed
@@ -529,14 +627,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             : null;
 
           if (matchedInFolder && parsed && parsed.isCleanVideoPage) {
-            // 当前标签页已经在播放歌单里的某首纯视频页，直接接管并自动开播
+            // 当前标签页已经在播放歌单里的某首纯视频页，直接接管（不重置进度，也不重洗本轮队列）
             state.currentTrack = matchedInFolder;
+            markTrackPlayedInRound(state, matchedInFolder.key);
             await saveState(state);
             await notifyTabMusicMode(targetTab.id, true, state);
           } else {
-            // /list/ml... 连播页或其他 B 站视频页：跳到纯粹的单视频页接管播放
             const trackToPlay = matchedInFolder || chooseNextTrack(state) || playable[0];
             state.currentTrack = trackToPlay;
+            if (trackToPlay) markTrackPlayedInRound(state, trackToPlay.key);
             await saveState(state);
             if (trackToPlay) {
               await navigateMusicTabToTrack(state, trackToPlay);
@@ -552,8 +651,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // 情况 2：已经有听歌标签页在运行 —— 直接复用它，不新开也不碰当前页
+        // 情况 2：已经有听歌标签页在运行 —— 直接复用它
         if (existingMusicTab) {
+          state.musicModeEnabled = true;
           const parsedExisting = parseBvidAndPFromUrl(existingMusicTab.url || "");
           const matchedExisting = parsedExisting
             ? (playable.find(t => t.bvid === parsedExisting.bvid && t.p === parsedExisting.p)
@@ -562,10 +662,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
           if (matchedExisting) {
             state.currentTrack = matchedExisting;
+            markTrackPlayedInRound(state, matchedExisting.key);
             await saveState(state);
           } else {
             const trackToPlay = chooseNextTrack(state) || playable[0];
             state.currentTrack = trackToPlay;
+            if (trackToPlay) markTrackPlayedInRound(state, trackToPlay.key);
             await saveState(state);
             if (trackToPlay) {
               await navigateMusicTabToTrack(state, trackToPlay);
@@ -581,7 +683,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // 情况 3：当前页不是 B 站视频页（网课、文档、搜索结果……）—— 新开一个标签页听歌，绝不覆盖当前页
+        // 情况 3：新开一个标签页听歌
         const trackToPlay = chooseNextTrack(state) || playable[0];
         if (!trackToPlay) {
           sendResponse({ ok: false, error: "歌单里没有可播放的歌曲", state });
@@ -606,6 +708,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "DISABLE_MUSIC_TAB": {
         const oldTabId = state.musicTabId;
         state.musicTabId = null;
+        state.musicModeEnabled = false;
         await saveState(state);
         if (oldTabId) {
           await notifyTabMusicMode(oldTabId, false, state);
@@ -617,9 +720,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "SET_PLAY_MODE": {
         if (["shuffle", "order", "loop"].includes(msg.playMode)) {
           state.playMode = msg.playMode;
-          if (msg.playMode === "shuffle") {
-            state.shuffleOrder = [];
-          }
+          // 注意：切换播放模式时不清空 shuffleOrder 和 playedKeysInRound，避免第一轮已听过的歌重新被抽中
           await saveState(state);
           if (state.musicTabId) {
             await notifyTabMusicMode(state.musicTabId, true, state);
@@ -632,8 +733,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "SWITCH_FOLDER": {
         const folderId = Number(msg.folderId);
         if (folderId) {
+          const folderChanged = Number(state.currentFolderId) !== folderId;
           state.currentFolderId = folderId;
-          state.shuffleOrder = [];
+          if (folderChanged) {
+            state.shuffleOrder = [];
+            state.playedKeysInRound = [];
+          }
           if (!state.itemsByFolder[folderId] || msg.force) {
             await syncFolderItems(state, folderId);
           }
@@ -673,9 +778,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             state.history = [...(state.history || []).slice(-99), state.currentTrack.key];
           }
           state.currentTrack = track;
+          state.currentProgress = { key: track.key, time: 0, paused: false, updatedAt: Date.now() };
+          state.musicModeEnabled = true;
+          markTrackPlayedInRound(state, track.key);
           await saveState(state);
 
-          // 已有听歌标签页就地切歌；没有的话新开一个标签页，绝不覆盖当前正在看的页面
           const existingMusicTab = await getTabSafely(state.musicTabId);
           if (existingMusicTab) {
             await navigateMusicTabToTrack(state, track);
@@ -750,7 +857,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const { bvid, pages } = msg;
         if (bvid && Array.isArray(pages)) {
           state.selectedPagesByBvid[bvid] = pages.map(Number).filter(n => n >= 1).sort((a, b) => a - b);
-          state.shuffleOrder = [];
+          // 只过滤掉已被取消勾选的分P，保留本轮已播记录与现有未播顺序
+          const validKeys = new Set(buildPlayableTracks(state).map(t => t.key));
+          state.shuffleOrder = (state.shuffleOrder || []).filter(k => validKeys.has(k));
           await saveState(state);
         }
         sendResponse({
@@ -769,7 +878,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } else {
             state.disabledBvids[bvid] = true;
           }
-          state.shuffleOrder = [];
+          const validKeys = new Set(buildPlayableTracks(state).map(t => t.key));
+          state.shuffleOrder = (state.shuffleOrder || []).filter(k => validKeys.has(k));
           await saveState(state);
         }
         sendResponse({
